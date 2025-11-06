@@ -7,8 +7,9 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING, Union
+from typing import Dict, Optional, Tuple, Union
 
 import mediapy
 import torch
@@ -16,22 +17,24 @@ import torch.distributed as dist
 import torchvision.transforms as T
 from cog import BasePredictor, Input, Path as CogPath
 from einops import rearrange
+from omegaconf import OmegaConf
 from PIL import Image
 from torchvision.io import read_video
 from torchvision.transforms import Compose, Lambda, Normalize
 
+from common.config import load_config
 from common.distributed import init_torch
 from common.distributed.ops import sync_data
 from common.seed import set_seed
 from data.image.transforms.divisible_crop import DivisibleCrop
 from data.image.transforms.na_resize import NaResize
 from data.video.transforms.rearrange import Rearrange
-from media_utils import cut_videos, mux_audio_stream
-from model_manager import ModelSpec, RunnerManager
-from weights import CKPT_DIR, MODEL_CACHE, WHEEL_DIR, ensure_model_cache, ensure_weight
+from projects.video_diffusion_sr.infer import VideoDiffusionInfer
 
-if TYPE_CHECKING:
-    from projects.video_diffusion_sr.infer import VideoDiffusionInfer
+MODEL_CACHE = Path("model_cache")
+BASE_URL = "https://weights.replicate.delivery/default/seedvr2/model_cache/"
+CKPT_DIR = MODEL_CACHE / "weights"
+WHEEL_DIR = MODEL_CACHE / "wheels"
 
 os.environ.setdefault("HF_HOME", str(MODEL_CACHE))
 os.environ.setdefault("TORCH_HOME", str(MODEL_CACHE))
@@ -39,13 +42,23 @@ os.environ.setdefault("HF_DATASETS_CACHE", str(MODEL_CACHE))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(MODEL_CACHE))
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+MODEL_CACHE.mkdir(parents=True, exist_ok=True)
+
 SHARED_WEIGHT_FILES = {
     "vae": "ema_vae.pth",
     "pos_emb": "pos_emb.pt",
     "neg_emb": "neg_emb.pt",
 }
 
-MODEL_VARIANTS = {
+# Runner metadata
+
+@dataclass(frozen=True)
+class ModelSpec:
+    weight: str
+    config: str
+
+
+MODEL_VARIANTS: Dict[str, ModelSpec] = {
     "3b": ModelSpec(weight="seedvr2_ema_3b.pth", config="configs_3b/main.yaml"),
     "7b": ModelSpec(weight="seedvr2_ema_7b.pth", config="configs_7b/main.yaml"),
 }
@@ -62,14 +75,12 @@ MODEL_FILES = [
 ]
 
 
-def download_weights(url: str, dest: str) -> None:
+def download_weights(url: str, dest: Path) -> None:
     start = time.time()
     print("[!] Initiating download from URL:", url)
     print("[~] Destination path:", dest)
-    target = dest
-    if dest.endswith(".tar"):
-        target = os.path.dirname(dest)
-    command = ["pget", "-vf" + ("x" if dest.endswith(".tar") else ""), url, target]
+    target = dest if dest.suffix != ".tar" else dest.parent
+    command = ["pget", "-vf" + ("x" if dest.suffix == ".tar" else ""), url, str(target)]
     try:
         print(f"[~] Running command: {' '.join(command)}")
         subprocess.check_call(command, close_fds=False)
@@ -152,6 +163,87 @@ def mux_audio_stream(src_media: Path, video_only: Path, output_path: Path) -> Pa
     return output_path
 
 
+def ensure_model_cache() -> None:
+    MODEL_CACHE.mkdir(parents=True, exist_ok=True)
+    for model_file in MODEL_FILES:
+        url = BASE_URL + model_file
+        dest_path = MODEL_CACHE / model_file
+        if model_file.endswith(".tar"):
+            extracted_path = dest_path.parent / model_file.replace(".tar", "")
+            if extracted_path.exists():
+                continue
+        elif dest_path.exists():
+            continue
+        download_weights(url, dest_path)
+
+
+class RunnerManager:
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+        self._bundles: Dict[str, Dict] = {}
+        self._active: Optional[str] = None
+
+    def use(self, variant: str) -> Tuple["VideoDiffusionInfer", OmegaConf]:
+        if variant not in MODEL_VARIANTS:
+            raise ValueError(f"Unknown model variant '{variant}'. Choose from {list(MODEL_VARIANTS.keys())}.")
+
+        bundle = self._bundles.get(variant)
+        if bundle is None:
+            bundle = self._build_runner(variant)
+        elif bundle["device"] != "cuda":
+            self._move_to_cuda(bundle)
+
+        if self._active and self._active != variant:
+            self._move_to_cpu(self._bundles[self._active])
+            torch.cuda.empty_cache()
+
+        self._active = variant
+        return bundle["runner"], bundle["config"]
+
+    def _build_runner(self, variant: str) -> Dict:
+        spec = MODEL_VARIANTS[variant]
+        weight_path = ensure_weight(spec.weight)
+        config = load_config(spec.config)
+        OmegaConf.set_readonly(config, False)
+
+        dit_model = config.dit.model
+        dit_model.norm = "rms"
+        dit_model.vid_out_norm = "rms"
+        if hasattr(dit_model, "txt_in_norm"):
+            dit_model.txt_in_norm = "layer"
+        if hasattr(dit_model, "qk_norm"):
+            dit_model.qk_norm = "rms"
+
+        runner = VideoDiffusionInfer(config)
+        runner.configure_dit_model(device="cuda", checkpoint=str(weight_path))
+        runner.configure_vae_model()
+        if hasattr(runner.vae, "set_memory_limit"):
+            runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
+
+        bundle = {"runner": runner, "config": config, "device": "cuda"}
+        self._bundles[variant] = bundle
+        return bundle
+
+    def _move_to_cuda(self, bundle: Dict) -> None:
+        runner: VideoDiffusionInfer = bundle["runner"]
+        runner.dit.to(self._device)
+        runner.vae.to(self._device)
+        runner.device = "cuda"
+        if hasattr(runner.vae, "set_memory_limit"):
+            runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
+        bundle["device"] = "cuda"
+
+    @staticmethod
+    def _move_to_cpu(bundle: Dict) -> None:
+        if bundle["device"] == "cpu":
+            return
+        runner: VideoDiffusionInfer = bundle["runner"]
+        runner.dit.to("cpu")
+        runner.vae.to("cpu")
+        runner.device = "cpu"
+        bundle["device"] = "cpu"
+
+
 class Predictor(BasePredictor):
     def setup(self) -> None:
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
@@ -174,12 +266,8 @@ class Predictor(BasePredictor):
 
         init_torch(cudnn_benchmark=False)
 
-        self.runners = RunnerManager(
-            device=self.device,
-            checkpoint_dir=CKPT_DIR,
-            specs=MODEL_VARIANTS,
-            default_variant=DEFAULT_MODEL_VARIANT,
-        )
+        self.runners = RunnerManager(device=self.device)
+        self.runners.use(DEFAULT_MODEL_VARIANT)
 
         if not getattr(self, "_destroy_registered", False):
             atexit.register(self._maybe_destroy_pg)
