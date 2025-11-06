@@ -188,14 +188,19 @@ class RunnerManager:
             raise ValueError(f"Unknown model variant '{variant}'. Choose from {list(MODEL_VARIANTS.keys())}.")
 
         bundle = self._bundles.get(variant)
-        if bundle is None:
-            bundle = self._build_runner(variant)
-        elif bundle["device"] != "cuda":
-            self._move_to_cuda(bundle)
+        previous = self._active if self._active in self._bundles else None
 
-        if self._active and self._active != variant:
-            self._move_to_cpu(self._bundles[self._active])
-            torch.cuda.empty_cache()
+        if bundle is None:
+            if previous:
+                self._move_to_cpu(self._bundles[previous])
+                torch.cuda.empty_cache()
+            bundle = self._build_runner(variant)
+        else:
+            if previous and previous != variant:
+                self._move_to_cpu(self._bundles[previous])
+                torch.cuda.empty_cache()
+            if bundle["device"] != "cuda":
+                self._move_to_cuda(bundle)
 
         self._active = variant
         return bundle["runner"], bundle["config"]
