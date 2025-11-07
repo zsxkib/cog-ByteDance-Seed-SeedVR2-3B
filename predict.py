@@ -96,12 +96,6 @@ def download_weights(url: str, dest: Path) -> None:
     print("[+] Download completed in:", time.time() - start, "seconds")
 
 
-def _resolve_numeric(value: Union[int, float], default: Union[int, float]) -> Union[int, float]:
-    if isinstance(value, (int, float)):
-        return value
-    return default
-
-
 def ensure_weight(filename: str) -> Path:
     path = CKPT_DIR / filename
     if not path.exists():
@@ -342,11 +336,11 @@ class Predictor(BasePredictor):
         if media_kind not in {"image", "video"}:
             raise ValueError("Unsupported file type. Provide a video or image.")
 
-        cfg_scale_val = float(_resolve_numeric(cfg_scale, 1.0))
-        sample_steps_val = int(_resolve_numeric(sample_steps, 1))
-        fps_val = int(_resolve_numeric(fps, 24))
-        sp_size_val = int(_resolve_numeric(sp_size, 1))
-        seed_val = int(_resolve_numeric(seed if seed is not None else torch.randint(0, 2**32, ()).item(), 666))
+        cfg_scale_val = float(cfg_scale)
+        sample_steps_val = int(sample_steps)
+        fps_val = int(fps)
+        sp_size_val = int(sp_size)
+        seed_val = int(seed if seed is not None else torch.randint(0, 2**32, ()).item())
 
         if model_variant not in MODEL_VARIANTS:
             raise ValueError(f"Unknown model variant '{model_variant}'. Choose from {list(MODEL_VARIANTS.keys())}.")
