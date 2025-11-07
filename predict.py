@@ -5,11 +5,14 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
 import mediapy
 import torch
@@ -334,14 +337,9 @@ class Predictor(BasePredictor):
             default=DEFAULT_MODEL_VARIANT,
         ),
     ) -> CogPath:
-        input_path = Path(media)
-        if not input_path.exists():
-            raise ValueError(f"Input file {input_path} not found.")
-
-        media_type, _ = mimetypes.guess_type(str(input_path))
-        is_video = media_type and media_type.startswith("video")
-        is_image = media_type and media_type.startswith("image")
-        if not (is_video or is_image):
+        input_path, cleanup = self._resolve_media_path(media)
+        media_kind = self._detect_media_kind(input_path)
+        if media_kind not in {"image", "video"}:
             raise ValueError("Unsupported file type. Provide a video or image.")
 
         cfg_scale_val = float(_resolve_numeric(cfg_scale, 1.0))
@@ -374,7 +372,7 @@ class Predictor(BasePredictor):
         cond_latents = []
         ori_lengths = []
 
-        if is_video:
+        if media_kind == "video":
             frames, _, _ = read_video(str(input_path), output_format="TCHW", pts_unit="sec")
             frames = frames.float() / 255.0
             if frames.size(0) > 121:
@@ -390,7 +388,7 @@ class Predictor(BasePredictor):
         cond_latents.append(cond)
         ori_lengths.append(cond.size(1))
 
-        if is_video:
+        if media_kind == "video":
             cond_latents = [cut_videos(cond, sp_size_val) for cond in cond_latents]
 
         with torch.inference_mode():
@@ -404,7 +402,7 @@ class Predictor(BasePredictor):
         sample = rearrange(sample[:, None], "t c h w -> t h w c") if sample.ndim == 3 else rearrange(sample, "t c h w -> t h w c")
         sample = sample.clip(-1, 1).mul_(0.5).add_(0.5).mul_(255).round().to(torch.uint8).cpu().numpy()
 
-        if is_image:
+        if media_kind == "image":
             img_array = sample[0]
             target_ext = output_format.lower()
             encoded_ext = "jpeg" if target_ext == "jpg" else target_ext
@@ -422,6 +420,8 @@ class Predictor(BasePredictor):
             output_name = mux_audio_stream(input_path, temp_video, final_video)
 
         torch.cuda.empty_cache()
+        if cleanup:
+            input_path.unlink(missing_ok=True)
         return CogPath(str(output_name))
 
     def _build_runner(self, variant: str) -> Tuple["VideoDiffusionInfer", OmegaConf]:
@@ -463,6 +463,42 @@ class Predictor(BasePredictor):
             return False
 
         return total_mem >= 120 * 1024**3
+
+    @staticmethod
+    def _resolve_media_path(media: Union[str, Path]) -> Tuple[Path, bool]:
+        candidate = Path(media)
+        if candidate.exists():
+            return candidate, False
+
+        media_str = str(media)
+        parsed = urlparse(media_str)
+        if parsed.scheme in {"http", "https"}:
+            suffix = Path(parsed.path).suffix or ""
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".bin") as tmp:
+                with urlopen(media_str) as src, open(tmp.name, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+            return Path(tmp.name), True
+
+        raise ValueError("Provide a local file path or an HTTP(S) URL.")
+
+    @staticmethod
+    def _detect_media_kind(path: Path) -> Optional[str]:
+        mime, _ = mimetypes.guess_type(str(path))
+        if mime:
+            if mime.startswith("image"):
+                return "image"
+            if mime.startswith("video"):
+                return "video"
+
+        # fallback: try to open as image
+        try:
+            with Image.open(str(path)) as img:
+                img.verify()
+            return "image"
+        except Exception:
+            pass
+
+        return "video"
 
     def _generation_step(self, runner: "VideoDiffusionInfer", cond_latents, text_embeds):
         noises = [torch.randn_like(latent) for latent in cond_latents]
